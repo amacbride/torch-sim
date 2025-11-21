@@ -14,14 +14,29 @@ except ImportError:
     VesinNeighborList = None
     VesinNeighborListTorch = None
 
-# Try to import hip_nl for AMD GPU acceleration
-try:
-    from hip_nl import hip_nl as _hip_nl_impl
+# hip_nl availability - checked lazily to avoid import-time side effects
+# hip_nl uses a standalone HIP context that conflicts with PyTorch's HIP backend,
+# so we only import it when explicitly requested via HSA_OVERRIDE_GFX_VERSION
+HIP_NL_AVAILABLE = False
+_hip_nl_impl = None
+_hip_nl_checked = False
 
-    HIP_NL_AVAILABLE = True
-except ImportError:
-    HIP_NL_AVAILABLE = False
-    _hip_nl_impl = None
+
+def _check_hip_nl_available():
+    """Lazily check if hip_nl is available. Only called when needed."""
+    global HIP_NL_AVAILABLE, _hip_nl_impl, _hip_nl_checked
+    if _hip_nl_checked:
+        return HIP_NL_AVAILABLE
+    _hip_nl_checked = True
+    try:
+        from hip_nl import hip_nl as impl
+        from hip_nl import HIP_NL_AVAILABLE as available
+        if available:
+            HIP_NL_AVAILABLE = True
+            _hip_nl_impl = impl
+    except ImportError:
+        pass
+    return HIP_NL_AVAILABLE
 
 import torch_sim.math as fm
 from torch_sim import transforms
@@ -706,9 +721,16 @@ def torchsim_nl(
         - For non-periodic systems (pbc=False), shifts will be zero vectors
         - The neighbor list includes both (i,j) and (j,i) pairs
     """
-    # Check if we're on AMD GPU with HIP support
-    # hip_nl manages GPU memory internally via HIP, so it works with CPU tensors too
-    if HIP_NL_AVAILABLE and torch.version.hip is not None:
+    # Check if we should use hip_nl (AMD GPU with HIP support)
+    # hip_nl requires explicit opt-in via USE_HIP_NL=1 environment variable
+    # because its standalone HIP context conflicts with PyTorch's HIP backend
+    import os
+
+    if (
+        os.environ.get("USE_HIP_NL") == "1"
+        and torch.version.hip is not None
+        and _check_hip_nl_available()
+    ):
         return _hip_nl_impl(positions, cell, pbc, cutoff, sort_id)
 
     # Use vesin if available (NVIDIA CUDA or CPU)

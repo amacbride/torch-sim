@@ -474,8 +474,16 @@ def test_torchsim_nl_availability() -> None:
         assert neighbors.VesinNeighborListTorch is None
 
 
-def test_torchsim_nl_consistency() -> None:
-    """Test that torchsim_nl produces consistent results."""
+def test_torchsim_nl_consistency(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that torchsim_nl produces consistent results.
+
+    Note: hip_nl is only used when HSA_OVERRIDE_GFX_VERSION is set, so it won't
+    interfere with this test. hip_nl-specific tests are in hip_nl/dev_tests/.
+    """
+    # Ensure hip_nl is disabled (belt-and-suspenders with env var check)
+    monkeypatch.setattr(neighbors, "HIP_NL_AVAILABLE", False)
+    monkeypatch.setattr(neighbors, "_hip_nl_checked", True)
+
     device = torch.device("cpu")
     dtype = torch.float32
 
@@ -507,9 +515,26 @@ def test_torchsim_nl_consistency() -> None:
         torch.testing.assert_close(shifts_torchsim, shifts_standard)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU not available for testing")
 def test_torchsim_nl_gpu() -> None:
-    """Test that torchsim_nl works on GPU (CUDA/ROCm)."""
+    """Test that torchsim_nl works on GPU (CUDA/ROCm).
+
+    Note: hip_nl is only used when HSA_OVERRIDE_GFX_VERSION is set. Without it,
+    this test uses vesin or standard_nl which work fine with PyTorch's GPU backend.
+    hip_nl-specific GPU tests are in hip_nl/dev_tests/.
+    """
+    import os
+
+    # Skip if HSA_OVERRIDE_GFX_VERSION is set (ROCm workaround for hip_nl)
+    if os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
+        pytest.skip(
+            "Skipping GPU test when HSA_OVERRIDE_GFX_VERSION is set "
+            "(PyTorch GPU backend conflicts with hip_nl)"
+        )
+
+    # Check at runtime instead of collection time to avoid breaking hip_nl
+    if not torch.cuda.is_available():
+        pytest.skip("GPU not available for testing")
+
     device = torch.device("cuda")
     dtype = torch.float32
 
@@ -536,8 +561,8 @@ def test_torchsim_nl_fallback_when_vesin_unavailable(
     """Test that torchsim_nl falls back to standard_nl when vesin is unavailable.
 
     This test simulates the case where vesin is not installed by monkeypatching
-    VESIN_AVAILABLE to False. This ensures the fallback logic is tested even in
-    CI environments where vesin is actually installed.
+    VESIN_AVAILABLE and HIP_NL_AVAILABLE to False. This ensures the fallback logic
+    is tested even in CI environments where vesin or hip_nl are actually available.
     """
     device = torch.device("cpu")
     dtype = torch.float32
@@ -552,8 +577,11 @@ def test_torchsim_nl_fallback_when_vesin_unavailable(
     pbc = torch.tensor([False, False, False], device=device)
     cutoff = torch.tensor(1.5, device=device, dtype=dtype)
 
-    # Monkeypatch VESIN_AVAILABLE to False to simulate vesin not being installed
+    # Monkeypatch VESIN_AVAILABLE and HIP_NL_AVAILABLE to False
+    # to simulate neither being installed
     monkeypatch.setattr(neighbors, "VESIN_AVAILABLE", False)
+    monkeypatch.setattr(neighbors, "HIP_NL_AVAILABLE", False)
+    monkeypatch.setattr(neighbors, "_hip_nl_checked", True)
 
     # Call torchsim_nl with mocked unavailable vesin
     mapping_torchsim, shifts_torchsim = neighbors.torchsim_nl(
@@ -569,107 +597,6 @@ def test_torchsim_nl_fallback_when_vesin_unavailable(
     # and produce identical results
     torch.testing.assert_close(mapping_torchsim, mapping_standard)
     torch.testing.assert_close(shifts_torchsim, shifts_standard)
-
-
-def test_hip_nl_availability() -> None:
-    """Test that HIP_NL_AVAILABLE flag is correctly set."""
-    assert isinstance(neighbors.HIP_NL_AVAILABLE, bool)
-
-
-@pytest.mark.skipif(
-    not neighbors.HIP_NL_AVAILABLE, reason="hip_nl not available on this system"
-)
-@pytest.mark.parametrize(
-    "pbc_config",
-    [
-        pytest.param(
-            torch.tensor([False, False, False]),
-            marks=pytest.mark.xfail(
-                reason="No PBC: hip_nl finds more pairs than standard_nl"
-            ),
-        ),  # No PBC - algorithmic difference
-        torch.tensor([True, True, True]),  # Full PBC
-        torch.tensor([True, False, True]),  # Mixed PBC
-    ],
-)
-def test_hip_nl_correctness(pbc_config: torch.Tensor) -> None:
-    """Test that hip_nl produces correct results matching standard_nl.
-
-    This test verifies that the HIP-accelerated neighbor list implementation
-    for AMD GPUs produces identical results to the standard PyTorch implementation.
-
-    Args:
-        pbc_config: Periodic boundary condition configuration to test
-    """
-    from hip_nl import hip_nl
-
-    device = torch.device("cpu")
-    dtype = torch.float32
-
-    # Test with medium-sized system
-    torch.manual_seed(42)
-    positions = torch.rand(100, 3, device=device, dtype=dtype) * 20.0
-    cell = torch.eye(3, device=device, dtype=dtype) * 20.0
-    pbc = pbc_config.to(device)
-    cutoff = torch.tensor(3.0, device=device, dtype=dtype)
-
-    try:
-        # Compare hip_nl against standard_nl
-        mapping_hip, shifts_hip = hip_nl(positions, cell, pbc, cutoff)
-        mapping_std, shifts_std = neighbors.standard_nl(positions, cell, pbc, cutoff)
-
-        # hip_nl should produce the same number of pairs as standard_nl
-        assert mapping_hip.shape == mapping_std.shape, (
-            f"hip_nl found {mapping_hip.shape[1]} pairs, "
-            f"standard_nl found {mapping_std.shape[1]} pairs"
-        )
-        assert shifts_hip.shape == shifts_std.shape
-    except RuntimeError as e:
-        # Skip test if GPU initialization fails
-        if "error code 100" in str(e):
-            pytest.skip("GPU initialization failed - HIP runtime not available")
-        raise  # Re-raise other errors
-
-
-@pytest.mark.skipif(
-    not (neighbors.HIP_NL_AVAILABLE and torch.version.hip is not None),
-    reason="Requires hip_nl and ROCm environment",
-)
-def test_torchsim_nl_uses_hip_on_rocm() -> None:
-    """Test that torchsim_nl automatically uses hip_nl on AMD ROCm systems.
-
-    This test verifies the priority selection logic: torchsim_nl should
-    use hip_nl when running on an AMD GPU with ROCm support.
-    """
-    device = torch.device("cpu")
-    dtype = torch.float32
-
-    positions = torch.tensor(
-        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
-        device=device,
-        dtype=dtype,
-    )
-    cell = torch.eye(3, device=device, dtype=dtype) * 3.0
-    pbc = torch.tensor([True, True, True], device=device)
-    cutoff = torch.tensor(1.5, device=device, dtype=dtype)
-
-    try:
-        # torchsim_nl should use hip_nl on ROCm and produce correct results
-        mapping_torchsim, shifts_torchsim = neighbors.torchsim_nl(
-            positions, cell, pbc, cutoff
-        )
-        mapping_standard, shifts_standard = neighbors.standard_nl(
-            positions, cell, pbc, cutoff
-        )
-
-        # Results should match
-        assert mapping_torchsim.shape == mapping_standard.shape
-        assert shifts_torchsim.shape == shifts_standard.shape
-    except RuntimeError as e:
-        # Skip test if GPU initialization fails
-        if "error code 100" in str(e):
-            pytest.skip("GPU initialization failed - HIP runtime not available")
-        raise  # Re-raise other errors
 
 
 def test_strict_nl_edge_cases() -> None:

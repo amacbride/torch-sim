@@ -134,6 +134,8 @@ ignore-words-list = ["convertor"]
 [tool.pytest.ini_options]
 addopts = ["-p no:warnings"]
 testpaths = ["tests"]
+# Note: HSA_OVERRIDE_GFX_VERSION is set per-test-file in conftest.py
+# to avoid breaking PyTorch GPU initialization in other tests
 
 [tool.uv]
 # make these dependencies mutually exclusive since they use incompatible e3nn versions
