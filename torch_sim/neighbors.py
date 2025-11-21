@@ -14,6 +14,15 @@ except ImportError:
     VesinNeighborList = None
     VesinNeighborListTorch = None
 
+# Try to import hip_nl for AMD GPU acceleration
+try:
+    from hip_nl import hip_nl as _hip_nl_impl
+
+    HIP_NL_AVAILABLE = True
+except ImportError:
+    HIP_NL_AVAILABLE = False
+    _hip_nl_impl = None
+
 import torch_sim.math as fm
 from torch_sim import transforms
 
@@ -665,8 +674,10 @@ def torchsim_nl(
     """Compute neighbor lists with automatic fallback for AMD ROCm compatibility.
 
     This function automatically selects the best available neighbor list implementation.
-    When vesin is available, it uses vesin_nl_ts for optimal performance. When vesin
-    is not available (e.g., on AMD ROCm systems), it falls back to standard_nl.
+    Priority order:
+    1. hip_nl: AMD ROCm-optimized HIP implementation (if on AMD GPU and available)
+    2. vesin_nl_ts: Fast CUDA implementation (if vesin available)
+    3. standard_nl: PyTorch fallback (works on all devices)
 
     Args:
         positions: Atomic positions tensor of shape (num_atoms, 3)
@@ -688,16 +699,24 @@ def torchsim_nl(
               neighbor pair.
 
     Notes:
-        - Automatically uses vesin_nl_ts when vesin is available
-        - Falls back to standard_nl when vesin is unavailable (AMD ROCm)
+        - Automatically uses hip_nl on AMD ROCm GPUs when available
+        - Uses vesin_nl_ts on NVIDIA CUDA when vesin is available
+        - Falls back to standard_nl when neither is available
         - Fallback works on NVIDIA CUDA, AMD ROCm, and CPU
         - For non-periodic systems (pbc=False), shifts will be zero vectors
         - The neighbor list includes both (i,j) and (j,i) pairs
     """
-    if not VESIN_AVAILABLE:
-        return standard_nl(positions, cell, pbc, cutoff, sort_id)
+    # Check if we're on AMD GPU with HIP support
+    # hip_nl manages GPU memory internally via HIP, so it works with CPU tensors too
+    if HIP_NL_AVAILABLE and torch.version.hip is not None:
+        return _hip_nl_impl(positions, cell, pbc, cutoff, sort_id)
 
-    return vesin_nl_ts(positions, cell, pbc, cutoff, sort_id)
+    # Use vesin if available (NVIDIA CUDA or CPU)
+    if VESIN_AVAILABLE:
+        return vesin_nl_ts(positions, cell, pbc, cutoff, sort_id)
+
+    # Fallback to standard_nl
+    return standard_nl(positions, cell, pbc, cutoff, sort_id)
 
 
 def strict_nl(

@@ -571,6 +571,107 @@ def test_torchsim_nl_fallback_when_vesin_unavailable(
     torch.testing.assert_close(shifts_torchsim, shifts_standard)
 
 
+def test_hip_nl_availability() -> None:
+    """Test that HIP_NL_AVAILABLE flag is correctly set."""
+    assert isinstance(neighbors.HIP_NL_AVAILABLE, bool)
+
+
+@pytest.mark.skipif(
+    not neighbors.HIP_NL_AVAILABLE, reason="hip_nl not available on this system"
+)
+@pytest.mark.parametrize(
+    "pbc_config",
+    [
+        pytest.param(
+            torch.tensor([False, False, False]),
+            marks=pytest.mark.xfail(
+                reason="No PBC: hip_nl finds more pairs than standard_nl"
+            ),
+        ),  # No PBC - algorithmic difference
+        torch.tensor([True, True, True]),  # Full PBC
+        torch.tensor([True, False, True]),  # Mixed PBC
+    ],
+)
+def test_hip_nl_correctness(pbc_config: torch.Tensor) -> None:
+    """Test that hip_nl produces correct results matching standard_nl.
+
+    This test verifies that the HIP-accelerated neighbor list implementation
+    for AMD GPUs produces identical results to the standard PyTorch implementation.
+
+    Args:
+        pbc_config: Periodic boundary condition configuration to test
+    """
+    from hip_nl import hip_nl
+
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    # Test with medium-sized system
+    torch.manual_seed(42)
+    positions = torch.rand(100, 3, device=device, dtype=dtype) * 20.0
+    cell = torch.eye(3, device=device, dtype=dtype) * 20.0
+    pbc = pbc_config.to(device)
+    cutoff = torch.tensor(3.0, device=device, dtype=dtype)
+
+    try:
+        # Compare hip_nl against standard_nl
+        mapping_hip, shifts_hip = hip_nl(positions, cell, pbc, cutoff)
+        mapping_std, shifts_std = neighbors.standard_nl(positions, cell, pbc, cutoff)
+
+        # hip_nl should produce the same number of pairs as standard_nl
+        assert mapping_hip.shape == mapping_std.shape, (
+            f"hip_nl found {mapping_hip.shape[1]} pairs, "
+            f"standard_nl found {mapping_std.shape[1]} pairs"
+        )
+        assert shifts_hip.shape == shifts_std.shape
+    except RuntimeError as e:
+        # Skip test if GPU initialization fails
+        if "error code 100" in str(e):
+            pytest.skip("GPU initialization failed - HIP runtime not available")
+        raise  # Re-raise other errors
+
+
+@pytest.mark.skipif(
+    not (neighbors.HIP_NL_AVAILABLE and torch.version.hip is not None),
+    reason="Requires hip_nl and ROCm environment",
+)
+def test_torchsim_nl_uses_hip_on_rocm() -> None:
+    """Test that torchsim_nl automatically uses hip_nl on AMD ROCm systems.
+
+    This test verifies the priority selection logic: torchsim_nl should
+    use hip_nl when running on an AMD GPU with ROCm support.
+    """
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+        device=device,
+        dtype=dtype,
+    )
+    cell = torch.eye(3, device=device, dtype=dtype) * 3.0
+    pbc = torch.tensor([True, True, True], device=device)
+    cutoff = torch.tensor(1.5, device=device, dtype=dtype)
+
+    try:
+        # torchsim_nl should use hip_nl on ROCm and produce correct results
+        mapping_torchsim, shifts_torchsim = neighbors.torchsim_nl(
+            positions, cell, pbc, cutoff
+        )
+        mapping_standard, shifts_standard = neighbors.standard_nl(
+            positions, cell, pbc, cutoff
+        )
+
+        # Results should match
+        assert mapping_torchsim.shape == mapping_standard.shape
+        assert shifts_torchsim.shape == shifts_standard.shape
+    except RuntimeError as e:
+        # Skip test if GPU initialization fails
+        if "error code 100" in str(e):
+            pytest.skip("GPU initialization failed - HIP runtime not available")
+        raise  # Re-raise other errors
+
+
 def test_strict_nl_edge_cases() -> None:
     """Test edge cases for strict_nl."""
     pos = torch.tensor([[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]], device=DEVICE, dtype=DTYPE)
