@@ -518,20 +518,10 @@ def test_torchsim_nl_consistency(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_torchsim_nl_gpu() -> None:
     """Test that torchsim_nl works on GPU (CUDA/ROCm).
 
-    Note: hip_nl is only used when HSA_OVERRIDE_GFX_VERSION is set. Without it,
-    this test uses vesin or standard_nl which work fine with PyTorch's GPU backend.
-    hip_nl-specific GPU tests are in hip_nl/dev_tests/.
+    On AMD ROCm, this uses hip_torch_nl which is a PyTorch C++ extension that
+    shares PyTorch's HIP context (no context conflicts). On NVIDIA CUDA, this
+    uses vesin or standard_nl.
     """
-    import os
-
-    # Skip if HSA_OVERRIDE_GFX_VERSION is set (ROCm workaround for hip_nl)
-    if os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
-        pytest.skip(
-            "Skipping GPU test when HSA_OVERRIDE_GFX_VERSION is set "
-            "(PyTorch GPU backend conflicts with hip_nl)"
-        )
-
-    # Check at runtime instead of collection time to avoid breaking hip_nl
     if not torch.cuda.is_available():
         pytest.skip("GPU not available for testing")
 

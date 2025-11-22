@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "torch>=2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hip_torch_nl"
+version = "0.1.0"
+description = "HIP-accelerated neighbor list for PyTorch (shares PyTorch HIP context)"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.0"]
+
+[tool.setuptools]
+packages = ["hip_torch_nl"]
+package-dir = {"hip_torch_nl" = "."}

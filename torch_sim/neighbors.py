@@ -16,7 +16,7 @@ except ImportError:
 
 # hip_nl availability - checked lazily to avoid import-time side effects
 # hip_nl uses a standalone HIP context that conflicts with PyTorch's HIP backend,
-# so we only import it when explicitly requested via HSA_OVERRIDE_GFX_VERSION
+# so we only import it when explicitly requested via USE_HIP_NL=1
 HIP_NL_AVAILABLE = False
 _hip_nl_impl = None
 _hip_nl_checked = False
@@ -37,6 +37,30 @@ def _check_hip_nl_available():
     except ImportError:
         pass
     return HIP_NL_AVAILABLE
+
+
+# hip_torch_nl availability - PyTorch C++ Extension version that shares PyTorch's
+# HIP context (no context conflicts). Preferred over hip_nl on AMD GPUs.
+HIP_TORCH_NL_AVAILABLE = False
+_hip_torch_nl_impl = None
+_hip_torch_nl_checked = False
+
+
+def _check_hip_torch_nl_available():
+    """Lazily check if hip_torch_nl is available. Only called when needed."""
+    global HIP_TORCH_NL_AVAILABLE, _hip_torch_nl_impl, _hip_torch_nl_checked
+    if _hip_torch_nl_checked:
+        return HIP_TORCH_NL_AVAILABLE
+    _hip_torch_nl_checked = True
+    try:
+        from hip_torch_nl import hip_torch_nl as impl
+        from hip_torch_nl import HIP_TORCH_NL_AVAILABLE as available
+        if available:
+            HIP_TORCH_NL_AVAILABLE = True
+            _hip_torch_nl_impl = impl
+    except ImportError:
+        pass
+    return HIP_TORCH_NL_AVAILABLE
 
 import torch_sim.math as fm
 from torch_sim import transforms
@@ -690,9 +714,12 @@ def torchsim_nl(
 
     This function automatically selects the best available neighbor list implementation.
     Priority order:
-    1. hip_nl: AMD ROCm-optimized HIP implementation (if on AMD GPU and available)
-    2. vesin_nl_ts: Fast CUDA implementation (if vesin available)
-    3. standard_nl: PyTorch fallback (works on all devices)
+    1. hip_torch_nl: AMD ROCm-optimized HIP implementation as PyTorch extension
+       (preferred on AMD GPUs - shares PyTorch's HIP context, no conflicts)
+    2. hip_nl: Legacy AMD ROCm HIP implementation (requires USE_HIP_NL=1 due to
+       context conflicts)
+    3. vesin_nl_ts: Fast CPU implementation (if vesin available)
+    4. standard_nl: PyTorch fallback (works on all devices)
 
     Args:
         positions: Atomic positions tensor of shape (num_atoms, 3)
@@ -714,24 +741,24 @@ def torchsim_nl(
               neighbor pair.
 
     Notes:
-        - Automatically uses hip_nl on AMD ROCm GPUs when available
+        - Automatically uses hip_torch_nl on AMD ROCm GPUs when available
         - Uses vesin_nl_ts on NVIDIA CUDA when vesin is available
         - Falls back to standard_nl when neither is available
         - Fallback works on NVIDIA CUDA, AMD ROCm, and CPU
         - For non-periodic systems (pbc=False), shifts will be zero vectors
         - The neighbor list includes both (i,j) and (j,i) pairs
     """
-    # Check if we should use hip_nl (AMD GPU with HIP support)
-    # hip_nl requires explicit opt-in via USE_HIP_NL=1 environment variable
-    # because its standalone HIP context conflicts with PyTorch's HIP backend
     import os
 
-    if (
-        os.environ.get("USE_HIP_NL") == "1"
-        and torch.version.hip is not None
-        and _check_hip_nl_available()
-    ):
-        return _hip_nl_impl(positions, cell, pbc, cutoff, sort_id)
+    # Check if we're on AMD ROCm
+    if torch.version.hip is not None and positions.is_cuda:
+        # Prefer hip_torch_nl (PyTorch extension, no context conflicts)
+        if _check_hip_torch_nl_available():
+            return _hip_torch_nl_impl(positions, cell, pbc, cutoff, sort_id)
+
+        # Fall back to hip_nl if USE_HIP_NL=1 (has context conflict issues)
+        if os.environ.get("USE_HIP_NL") == "1" and _check_hip_nl_available():
+            return _hip_nl_impl(positions, cell, pbc, cutoff, sort_id)
 
     # Use vesin if available (NVIDIA CUDA or CPU)
     if VESIN_AVAILABLE:
