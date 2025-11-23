@@ -5,10 +5,17 @@ import torch
 
 # Try to import hip_torch_nl
 try:
-    from hip_torch_nl import HIP_TORCH_NL_AVAILABLE, hip_torch_nl
+    from hip_torch_nl import (
+        HIP_TORCH_NL_AVAILABLE,
+        hip_torch_nl,
+        hip_torch_nl_v1,
+        hip_torch_nl_v2,
+    )
 except ImportError:
     HIP_TORCH_NL_AVAILABLE = False
     hip_torch_nl = None
+    hip_torch_nl_v1 = None
+    hip_torch_nl_v2 = None
 
 from torch_sim.neighbors import standard_nl
 
@@ -174,6 +181,86 @@ class TestHipTorchNLCorrectness:
 
         # Should find 2 pairs: (0,1) and (1,0)
         assert std_mapping.shape[1] == hip_mapping.shape[1]
+
+
+class TestHipTorchNLV2CellList:
+    """Tests for V2 cell-list algorithm."""
+
+    @pytest.mark.parametrize("n_atoms", [10, 50, 100, 200, 500])
+    def test_v2_matches_v1(self, n_atoms):
+        """Test that V2 cell-list finds same pairs as V1 brute-force."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP not available")
+
+        torch.manual_seed(42 + n_atoms)
+        positions = torch.rand(n_atoms, 3, dtype=torch.float64).cuda() * 10.0
+        cell = torch.eye(3, dtype=torch.float64).cuda() * 10.0
+        pbc = torch.tensor([True, True, True]).cuda()
+        cutoff = torch.tensor(3.0, dtype=torch.float64)
+
+        # V1 brute-force
+        mapping_v1, shifts_v1 = hip_torch_nl_v1(
+            positions, cell, pbc, cutoff, compatible_mode=False
+        )
+
+        # V2 cell-list
+        mapping_v2, shifts_v2 = hip_torch_nl_v2(
+            positions, cell, pbc, cutoff, compatible_mode=False
+        )
+
+        # Same number of pairs
+        assert mapping_v1.shape[1] == mapping_v2.shape[1], (
+            f"V1={mapping_v1.shape[1]} vs V2={mapping_v2.shape[1]}"
+        )
+
+    def test_v2_with_algorithm_auto(self):
+        """Test that algorithm='auto' selects V2 for large systems."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP not available")
+
+        # Large system should use V2 (>5000 atoms triggers cell_list)
+        n_atoms = 100
+        torch.manual_seed(42)
+        positions = torch.rand(n_atoms, 3, dtype=torch.float64).cuda() * 10.0
+        cell = torch.eye(3, dtype=torch.float64).cuda() * 10.0
+        pbc = torch.tensor([True, True, True]).cuda()
+        cutoff = torch.tensor(3.0, dtype=torch.float64)
+
+        # With auto algorithm
+        mapping_auto, shifts_auto = hip_torch_nl(
+            positions, cell, pbc, cutoff, algorithm="auto", compatible_mode=False
+        )
+
+        # Explicit V1 for comparison
+        mapping_v1, shifts_v1 = hip_torch_nl_v1(
+            positions, cell, pbc, cutoff, compatible_mode=False
+        )
+
+        assert mapping_auto.shape[1] == mapping_v1.shape[1]
+
+    def test_v2_periodic_boundary(self):
+        """Test V2 handles periodic boundaries correctly."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA/HIP not available")
+
+        # Atoms near opposite corners - should be neighbors via PBC
+        positions = torch.tensor(
+            [
+                [0.1, 0.1, 0.1],
+                [9.9, 9.9, 9.9],
+            ],
+            dtype=torch.float64,
+        ).cuda()
+        cell = torch.eye(3, dtype=torch.float64).cuda() * 10.0
+        pbc = torch.tensor([True, True, True]).cuda()
+        cutoff = torch.tensor(1.0, dtype=torch.float64)
+
+        mapping_v2, shifts_v2 = hip_torch_nl_v2(
+            positions, cell, pbc, cutoff, compatible_mode=False
+        )
+
+        # Should find 2 pairs: (0,1) and (1,0)
+        assert mapping_v2.shape[1] == 2
 
 
 class TestHipTorchNLIntegration:

@@ -88,6 +88,7 @@ def hip_torch_nl(
     cutoff: torch.Tensor,
     sort_id: bool = False,
     compatible_mode: bool = True,
+    algorithm: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute neighbor list using HIP acceleration (PyTorch Extension).
 
@@ -95,6 +96,10 @@ def hip_torch_nl(
     computation that integrates with PyTorch's HIP context. Unlike the
     standalone hip_nl, this can be used alongside other PyTorch GPU
     operations without context conflicts.
+
+    Supports two algorithms:
+        - V1 (direct): O(n²) direct pairwise - Faster but memory-limited (~16k atoms max)
+        - V2 (cell_list): O(n) cell-list - Slightly slower but handles larger systems (~28k atoms)
 
     Args:
         positions: Atomic positions tensor of shape (n_atoms, 3). Must be on GPU.
@@ -104,6 +109,8 @@ def hip_torch_nl(
         sort_id: If True, sort pairs by first index
         compatible_mode: If True (default), filter results to exactly match
             standard_nl output. Set to False for all valid pairs.
+        algorithm: Algorithm to use - 'auto' (default), 'direct'/'v1',
+            or 'cell_list'/'v2'. 'auto' selects based on system size.
 
     Returns:
         tuple: (mapping, shifts) where:
@@ -134,8 +141,10 @@ def hip_torch_nl(
     cell = cell.to(original_device)
     pbc = pbc.to(original_device)
 
-    # Call the C++ extension
-    mapping, shifts = _C_module.compute_neighborlist(positions, cell, pbc, cutoff_val)
+    # Call the C++ extension with algorithm selection
+    mapping, shifts = _C_module.compute_neighborlist(
+        positions, cell, pbc, cutoff_val, algorithm
+    )
 
     # Apply compatibility filter for non-periodic boundaries if requested
     if compatible_mode and not pbc.all():
@@ -154,4 +163,43 @@ def hip_torch_nl(
     return mapping, shifts
 
 
-__all__ = ["HIP_TORCH_NL_AVAILABLE", "hip_torch_nl"]
+def hip_torch_nl_v1(
+    positions: torch.Tensor,
+    cell: torch.Tensor,
+    pbc: torch.Tensor,
+    cutoff: torch.Tensor,
+    sort_id: bool = False,
+    compatible_mode: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """V1: Direct pairwise O(n²) neighbor list - faster but memory-limited (~16k atoms max).
+
+    See hip_torch_nl for full documentation.
+    """
+    return hip_torch_nl(
+        positions, cell, pbc, cutoff, sort_id, compatible_mode, algorithm="direct"
+    )
+
+
+def hip_torch_nl_v2(
+    positions: torch.Tensor,
+    cell: torch.Tensor,
+    pbc: torch.Tensor,
+    cutoff: torch.Tensor,
+    sort_id: bool = False,
+    compatible_mode: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """V2: Cell-list O(n) neighbor list - handles larger systems (~28k atoms).
+
+    See hip_torch_nl for full documentation.
+    """
+    return hip_torch_nl(
+        positions, cell, pbc, cutoff, sort_id, compatible_mode, algorithm="cell_list"
+    )
+
+
+__all__ = [
+    "HIP_TORCH_NL_AVAILABLE",
+    "hip_torch_nl",
+    "hip_torch_nl_v1",
+    "hip_torch_nl_v2",
+]

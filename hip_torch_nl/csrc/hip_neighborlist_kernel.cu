@@ -160,6 +160,379 @@ __global__ void compute_neighbors_full(
     }
 }
 
+// ============================================================================
+// V2: Cell-List Algorithm O(n) - Better for large systems (>5000 atoms)
+// ============================================================================
+
+// Kernel to assign atoms to cells and count atoms per cell
+__global__ void assign_atoms_to_cells(
+    const double3* positions,
+    size_t n_points,
+    const double3 inv_box[3],
+    int3 n_cells,
+    int* cell_indices,      // Output: cell index for each atom
+    int* cell_counts        // Output: number of atoms in each cell (atomically incremented)
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_points) return;
+
+    double3 pos = positions[i];
+
+    // Convert to fractional coordinates [0, 1)
+    double3 frac = make_double3(
+        dot(pos, inv_box[0]),
+        dot(pos, inv_box[1]),
+        dot(pos, inv_box[2])
+    );
+
+    // Wrap to [0, 1)
+    frac.x = frac.x - floor(frac.x);
+    frac.y = frac.y - floor(frac.y);
+    frac.z = frac.z - floor(frac.z);
+
+    // Compute cell indices
+    int cx = min((int)(frac.x * n_cells.x), n_cells.x - 1);
+    int cy = min((int)(frac.y * n_cells.y), n_cells.y - 1);
+    int cz = min((int)(frac.z * n_cells.z), n_cells.z - 1);
+
+    // Linear cell index
+    int cell_idx = cx + n_cells.x * (cy + n_cells.y * cz);
+    cell_indices[i] = cell_idx;
+
+    // Atomically increment count for this cell
+    atomicAdd(&cell_counts[cell_idx], 1);
+}
+
+// Kernel to build cell lists (scatter atoms into cell arrays)
+__global__ void build_cell_lists(
+    size_t n_points,
+    const int* cell_indices,
+    int* cell_offsets,      // Input: prefix sum of cell counts (start index for each cell)
+    int* cell_counts,       // Input/Output: current count per cell (used as local offset)
+    int* cell_atoms         // Output: atom indices organized by cell
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_points) return;
+
+    int cell_idx = cell_indices[i];
+    int local_idx = atomicAdd(&cell_counts[cell_idx], 1);
+    int global_idx = cell_offsets[cell_idx] + local_idx;
+    cell_atoms[global_idx] = (int)i;
+}
+
+// Main V2 kernel: search neighbors using cell lists
+__global__ void compute_neighbors_cell_list(
+    const double3* positions,
+    size_t n_points,
+    const double3 box[3],
+    const double3 inv_box[3],
+    const bool periodic[3],
+    double cutoff,
+    int3 n_cells,
+    const int* cell_indices,
+    const int* cell_offsets,
+    const int* cell_atom_counts,  // Original counts (not modified)
+    const int* cell_atoms,
+    ulong2* pairs,
+    int3* shifts_out,
+    size_t* n_pairs
+) {
+    // Shared memory for box matrices
+    __shared__ double3 s_box[3];
+    __shared__ double3 s_inv_box[3];
+    __shared__ bool s_periodic[3];
+
+    if (threadIdx.x < 3) {
+        s_box[threadIdx.x] = box[threadIdx.x];
+        s_inv_box[threadIdx.x] = inv_box[threadIdx.x];
+        s_periodic[threadIdx.x] = periodic[threadIdx.x];
+    }
+    __syncthreads();
+
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_points) return;
+
+    double3 pos_i = positions[i];
+    double cutoff_sq = cutoff * cutoff;
+    int cell_i = cell_indices[i];
+
+    // Compute 3D cell coordinates for atom i
+    int cz_i = cell_i / (n_cells.x * n_cells.y);
+    int rem = cell_i % (n_cells.x * n_cells.y);
+    int cy_i = rem / n_cells.x;
+    int cx_i = rem % n_cells.x;
+
+    // Iterate over 27 neighboring cells (including self)
+    for (int dcz = -1; dcz <= 1; dcz++) {
+        for (int dcy = -1; dcy <= 1; dcy++) {
+            for (int dcx = -1; dcx <= 1; dcx++) {
+                int cx_j = cx_i + dcx;
+                int cy_j = cy_i + dcy;
+                int cz_j = cz_i + dcz;
+
+                // Cell shift for periodic boundaries
+                int3 cell_shift = make_int3(0, 0, 0);
+
+                // Handle periodic wrapping
+                // Sign convention: shift = round(frac) where frac = (j-i) / cell
+                // If we access cell -1 (wrapped to n-1), j is on the "far side"
+                // The vector j-i spans most of the box, so shift should be +1
+                if (s_periodic[0]) {
+                    if (cx_j < 0) { cx_j += n_cells.x; cell_shift.x = +1; }
+                    else if (cx_j >= n_cells.x) { cx_j -= n_cells.x; cell_shift.x = -1; }
+                } else {
+                    if (cx_j < 0 || cx_j >= n_cells.x) continue;
+                }
+
+                if (s_periodic[1]) {
+                    if (cy_j < 0) { cy_j += n_cells.y; cell_shift.y = +1; }
+                    else if (cy_j >= n_cells.y) { cy_j -= n_cells.y; cell_shift.y = -1; }
+                } else {
+                    if (cy_j < 0 || cy_j >= n_cells.y) continue;
+                }
+
+                if (s_periodic[2]) {
+                    if (cz_j < 0) { cz_j += n_cells.z; cell_shift.z = +1; }
+                    else if (cz_j >= n_cells.z) { cz_j -= n_cells.z; cell_shift.z = -1; }
+                } else {
+                    if (cz_j < 0 || cz_j >= n_cells.z) continue;
+                }
+
+                int cell_j = cx_j + n_cells.x * (cy_j + n_cells.y * cz_j);
+                int start_j = cell_offsets[cell_j];
+                int count_j = cell_atom_counts[cell_j];
+
+                // Check all atoms in neighboring cell
+                for (int k = 0; k < count_j; k++) {
+                    int j = cell_atoms[start_j + k];
+
+                    double3 pos_j = positions[j];
+                    double3 vec = pos_j - pos_i;
+
+                    // Apply MIC to get minimum image and shift
+                    // MIC handles all periodic wrapping - cell_shift just tracks
+                    // which periodic image we expect to find the pair in
+                    int3 shift;
+                    vec = apply_mic(vec, s_box, s_inv_box, s_periodic, shift);
+
+                    double dist_sq = dot(vec, vec);
+
+                    // Check if this is a valid pair
+                    // For the same cell (cell_shift=0), accept the pair if within cutoff
+                    // For wrapped cells (cell_shift!=0), only accept if the MIC shift matches
+                    // to avoid counting pairs multiple times through different cells
+                    bool shift_matches = (shift.x == cell_shift.x &&
+                                         shift.y == cell_shift.y &&
+                                         shift.z == cell_shift.z);
+                    bool valid = (dist_sq < cutoff_sq) && shift_matches &&
+                                 (i != j || shift.x != 0 || shift.y != 0 || shift.z != 0);
+
+                    if (valid) {
+                        size_t out_idx = atomicAdd((unsigned long long*)n_pairs, 1ULL);
+                        pairs[out_idx] = make_ulong2(i, j);
+                        shifts_out[out_idx] = shift;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// V2 Host wrapper: Cell-list algorithm
+std::tuple<torch::Tensor, torch::Tensor> hip_compute_neighborlist_cell_list(
+    torch::Tensor positions,
+    torch::Tensor cell,
+    torch::Tensor pbc,
+    double cutoff
+) {
+    auto device = positions.device();
+    const size_t n_points = positions.size(0);
+
+    // Prepare box matrices on host
+    double3 h_box[3], h_inv_box[3];
+    bool h_periodic[3];
+
+    auto cell_cpu = cell.cpu();
+    auto pbc_cpu = pbc.cpu();
+
+    for (int i = 0; i < 3; i++) {
+        h_box[i].x = cell_cpu[i][0].item<double>();
+        h_box[i].y = cell_cpu[i][1].item<double>();
+        h_box[i].z = cell_cpu[i][2].item<double>();
+        h_periodic[i] = pbc_cpu[i].item<bool>();
+    }
+
+    invert_3x3(h_box, h_inv_box);
+
+    // Compute cell dimensions: each cell should be at least cutoff in size
+    // Use reciprocal lattice to get face distances
+    double face_dist[3];
+    for (int i = 0; i < 3; i++) {
+        double len = sqrt(h_inv_box[i].x * h_inv_box[i].x +
+                         h_inv_box[i].y * h_inv_box[i].y +
+                         h_inv_box[i].z * h_inv_box[i].z);
+        face_dist[i] = (len > 0) ? 1.0 / len : 1.0;
+    }
+
+    int3 n_cells;
+    n_cells.x = std::max(1, (int)(face_dist[0] / cutoff));
+    n_cells.y = std::max(1, (int)(face_dist[1] / cutoff));
+    n_cells.z = std::max(1, (int)(face_dist[2] / cutoff));
+    int total_cells = n_cells.x * n_cells.y * n_cells.z;
+
+    // Allocate device memory
+    auto options_d3 = torch::TensorOptions().dtype(torch::kFloat64).device(device);
+    auto options_bool = torch::TensorOptions().dtype(torch::kBool).device(device);
+    auto options_int = torch::TensorOptions().dtype(torch::kInt32).device(device);
+    auto options_long = torch::TensorOptions().dtype(torch::kInt64).device(device);
+
+    // Box matrices
+    auto d_box = torch::empty({3, 3}, options_d3);
+    auto d_inv_box = torch::empty({3, 3}, options_d3);
+    auto d_periodic = torch::empty({3}, options_bool);
+
+    {
+        auto d_box_cpu = torch::empty({3, 3}, torch::TensorOptions().dtype(torch::kFloat64));
+        auto d_inv_box_cpu = torch::empty({3, 3}, torch::TensorOptions().dtype(torch::kFloat64));
+        auto d_periodic_cpu = torch::empty({3}, torch::TensorOptions().dtype(torch::kBool));
+
+        for (int i = 0; i < 3; i++) {
+            d_box_cpu[i][0] = h_box[i].x;
+            d_box_cpu[i][1] = h_box[i].y;
+            d_box_cpu[i][2] = h_box[i].z;
+            d_inv_box_cpu[i][0] = h_inv_box[i].x;
+            d_inv_box_cpu[i][1] = h_inv_box[i].y;
+            d_inv_box_cpu[i][2] = h_inv_box[i].z;
+            d_periodic_cpu[i] = h_periodic[i];
+        }
+
+        d_box.copy_(d_box_cpu);
+        d_inv_box.copy_(d_inv_box_cpu);
+        d_periodic.copy_(d_periodic_cpu);
+    }
+
+    // Cell data structures
+    auto cell_indices = torch::empty({static_cast<long>(n_points)}, options_int);
+    auto cell_counts = torch::zeros({total_cells}, options_int);
+    auto cell_offsets = torch::empty({total_cells}, options_int);
+    auto cell_atoms = torch::empty({static_cast<long>(n_points)}, options_int);
+
+    hipStream_t stream = (hipStream_t)at::cuda::getDefaultCUDAStream();
+    int threads = 256;
+    int blocks = (n_points + threads - 1) / threads;
+
+    // Phase 1: Assign atoms to cells
+    hipLaunchKernelGGL(
+        assign_atoms_to_cells,
+        dim3(blocks), dim3(threads), 0, stream,
+        reinterpret_cast<const double3*>(positions.data_ptr<double>()),
+        n_points,
+        reinterpret_cast<const double3*>(d_inv_box.data_ptr<double>()),
+        n_cells,
+        cell_indices.data_ptr<int>(),
+        cell_counts.data_ptr<int>()
+    );
+
+    hipError_t err = hipGetLastError();
+    TORCH_CHECK(err == hipSuccess, "assign_atoms_to_cells error: ", hipGetErrorString(err));
+
+    // Phase 2: Compute prefix sum for cell offsets (exclusive scan)
+    // Use PyTorch's cumsum for simplicity
+    hipDeviceSynchronize();
+    auto cell_counts_copy = cell_counts.clone();  // Save original counts
+    // cumsum might return Long, cast back to Int32
+    cell_offsets = (torch::cumsum(cell_counts, 0) - cell_counts).to(torch::kInt32);
+    cell_counts.zero_();  // Reset for scatter phase
+
+    // Phase 3: Build cell lists (scatter atoms)
+    hipLaunchKernelGGL(
+        build_cell_lists,
+        dim3(blocks), dim3(threads), 0, stream,
+        n_points,
+        cell_indices.data_ptr<int>(),
+        cell_offsets.data_ptr<int>(),
+        cell_counts.data_ptr<int>(),
+        cell_atoms.data_ptr<int>()
+    );
+
+    err = hipGetLastError();
+    TORCH_CHECK(err == hipSuccess, "build_cell_lists error: ", hipGetErrorString(err));
+
+    // Phase 4: Search neighbors
+    // Pairs scale as O(n²) for fixed box/cutoff. At cutoff=3.0, box=10.0:
+    // 1000 atoms: ~113K pairs, 2000 atoms: ~452K pairs
+    // Use n²/10 as estimate with 1.5x safety margin
+    size_t estimated_pairs = std::max((size_t)(n_points * n_points / 7), n_points * 200UL);
+
+    auto d_pairs = torch::empty({static_cast<long>(estimated_pairs), 2}, options_long);
+    auto d_shifts = torch::empty({static_cast<long>(estimated_pairs), 3}, options_int);
+    auto d_n_pairs = torch::zeros({1}, options_long);
+
+    hipLaunchKernelGGL(
+        compute_neighbors_cell_list,
+        dim3(blocks), dim3(threads), 0, stream,
+        reinterpret_cast<const double3*>(positions.data_ptr<double>()),
+        n_points,
+        reinterpret_cast<const double3*>(d_box.data_ptr<double>()),
+        reinterpret_cast<const double3*>(d_inv_box.data_ptr<double>()),
+        d_periodic.data_ptr<bool>(),
+        cutoff,
+        n_cells,
+        cell_indices.data_ptr<int>(),
+        cell_offsets.data_ptr<int>(),
+        cell_counts_copy.data_ptr<int>(),
+        cell_atoms.data_ptr<int>(),
+        reinterpret_cast<ulong2*>(d_pairs.data_ptr<int64_t>()),
+        reinterpret_cast<int3*>(d_shifts.data_ptr<int32_t>()),
+        reinterpret_cast<size_t*>(d_n_pairs.data_ptr<int64_t>())
+    );
+
+    err = hipGetLastError();
+    TORCH_CHECK(err == hipSuccess, "compute_neighbors_cell_list error: ", hipGetErrorString(err));
+
+    hipDeviceSynchronize();
+
+    size_t n_pairs_val = d_n_pairs.cpu().item<int64_t>();
+
+    // Handle overflow: if we got more pairs than estimated, reallocate and retry
+    if (n_pairs_val > estimated_pairs) {
+        d_pairs = torch::empty({static_cast<long>(n_pairs_val + 1000), 2}, options_long);
+        d_shifts = torch::empty({static_cast<long>(n_pairs_val + 1000), 3}, options_int);
+        d_n_pairs.zero_();
+
+        hipLaunchKernelGGL(
+            compute_neighbors_cell_list,
+            dim3(blocks), dim3(threads), 0, stream,
+            reinterpret_cast<const double3*>(positions.data_ptr<double>()),
+            n_points,
+            reinterpret_cast<const double3*>(d_box.data_ptr<double>()),
+            reinterpret_cast<const double3*>(d_inv_box.data_ptr<double>()),
+            d_periodic.data_ptr<bool>(),
+            cutoff,
+            n_cells,
+            cell_indices.data_ptr<int>(),
+            cell_offsets.data_ptr<int>(),
+            cell_counts_copy.data_ptr<int>(),
+            cell_atoms.data_ptr<int>(),
+            reinterpret_cast<ulong2*>(d_pairs.data_ptr<int64_t>()),
+            reinterpret_cast<int3*>(d_shifts.data_ptr<int32_t>()),
+            reinterpret_cast<size_t*>(d_n_pairs.data_ptr<int64_t>())
+        );
+
+        hipDeviceSynchronize();
+        n_pairs_val = d_n_pairs.cpu().item<int64_t>();
+    }
+
+    auto mapping = d_pairs.slice(0, 0, n_pairs_val).t().contiguous();
+    auto shifts = d_shifts.slice(0, 0, n_pairs_val).to(torch::kFloat32);
+
+    return std::make_tuple(mapping, shifts);
+}
+
+// ============================================================================
+// V1: Brute-Force Algorithm O(n²) - Better for small systems (<5000 atoms)
+// ============================================================================
+
 // Host wrapper function that integrates with PyTorch
 std::tuple<torch::Tensor, torch::Tensor> hip_compute_neighborlist_kernel(
     torch::Tensor positions,

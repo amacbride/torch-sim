@@ -11,6 +11,23 @@ Or build in-place:
 import os
 from pathlib import Path
 
+# This is a HIP extension for AMD GPUs - configure environment for ROCm build
+# If CUDA_HOME points to a non-existent path (common on ROCm-only systems), clear it
+if "CUDA_HOME" in os.environ:
+    cuda_home = os.environ["CUDA_HOME"]
+    if not os.path.exists(cuda_home) or not os.path.exists(os.path.join(cuda_home, "bin")):
+        del os.environ["CUDA_HOME"]
+
+# Find and set ROCM_HOME
+rocm_paths = ["/opt/rocm", "/opt/rocm-7.0.1", "/opt/rocm-6.0.0"]
+for rocm_path in rocm_paths:
+    if os.path.exists(rocm_path):
+        os.environ["ROCM_HOME"] = rocm_path
+        # PyTorch's CUDAExtension uses CUDA_HOME - point it to ROCm for hipcc
+        if "CUDA_HOME" not in os.environ:
+            os.environ["CUDA_HOME"] = rocm_path
+        break
+
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
