@@ -233,9 +233,10 @@ __global__ void compute_neighbors_cell_list(
     const int* cell_offsets,
     const int* cell_atom_counts,  // Original counts (not modified)
     const int* cell_atoms,
-    ulong2* pairs,
+    uint2* pairs,           // Changed from ulong2 to uint2 (int32) - saves 50% memory
     int3* shifts_out,
-    size_t* n_pairs
+    size_t* n_pairs,
+    size_t max_pairs  // Buffer size - pairs beyond this are counted but not written
 ) {
     // Shared memory for box matrices
     __shared__ double3 s_box[3];
@@ -329,8 +330,12 @@ __global__ void compute_neighbors_cell_list(
 
                     if (valid) {
                         size_t out_idx = atomicAdd((unsigned long long*)n_pairs, 1ULL);
-                        pairs[out_idx] = make_ulong2(i, j);
-                        shifts_out[out_idx] = shift;
+                        // Only write if within buffer bounds (count overflow but don't write)
+                        if (out_idx < max_pairs) {
+                            pairs[out_idx] = make_uint2((unsigned int)i, (unsigned int)j);
+                            shifts_out[out_idx] = shift;
+                        }
+                        // else: pair is counted but not written (overflow detected on host)
                     }
                 }
             }
@@ -459,12 +464,39 @@ std::tuple<torch::Tensor, torch::Tensor> hip_compute_neighborlist_cell_list(
     TORCH_CHECK(err == hipSuccess, "build_cell_lists error: ", hipGetErrorString(err));
 
     // Phase 4: Search neighbors
-    // Pairs scale as O(n²) for fixed box/cutoff. At cutoff=3.0, box=10.0:
-    // 1000 atoms: ~113K pairs, 2000 atoms: ~452K pairs
-    // Use n²/10 as estimate with 1.5x safety margin
-    size_t estimated_pairs = std::max((size_t)(n_points * n_points / 7), n_points * 200UL);
+    // Memory-efficient pair estimation using density scaling:
+    // For uniform density, pairs ≈ n * avg_neighbors where avg_neighbors = n * V_cutoff / V_box
+    // V_cutoff = 4/3 * π * r³, so pairs ≈ n * n * (4π/3 * cutoff³) / V_box
+    // This is O(n) for fixed density (n/V_box constant), O(n²) for fixed box size
+    //
+    // Calculate box volume from cell vectors
+    double3 cross;
+    cross.x = h_box[1].y * h_box[2].z - h_box[1].z * h_box[2].y;
+    cross.y = h_box[1].z * h_box[2].x - h_box[1].x * h_box[2].z;
+    cross.z = h_box[1].x * h_box[2].y - h_box[1].y * h_box[2].x;
+    double box_volume = fabs(h_box[0].x * cross.x + h_box[0].y * cross.y + h_box[0].z * cross.z);
 
-    auto d_pairs = torch::empty({static_cast<long>(estimated_pairs), 2}, options_long);
+    // Cutoff sphere volume (this counts each pair twice since we output i->j and j->i)
+    double cutoff_volume = (4.0 / 3.0) * M_PI * cutoff * cutoff * cutoff;
+
+    // Expected pairs per atom = number_density * cutoff_volume * 2 (for both directions)
+    double number_density = (double)n_points / box_volume;
+    double avg_neighbors = number_density * cutoff_volume * 2.0;
+
+    // Estimated pairs with 1.5x safety margin for non-uniformity
+    // Minimum of 100 pairs per atom to handle sparse systems
+    size_t estimated_pairs = (size_t)(n_points * std::max(avg_neighbors * 1.5, 100.0));
+
+    // Cap estimation to avoid OOM - use incremental growth strategy instead
+    // Each pair costs 20 bytes (8 for int32x2 + 12 for int32x3)
+    // Start with reasonable allocation, rely on retry for large systems
+    size_t bytes_per_pair = 20;
+    size_t max_initial_bytes = 2UL * 1024 * 1024 * 1024;  // 2GB initial limit
+    size_t max_initial_pairs = max_initial_bytes / bytes_per_pair;
+    estimated_pairs = std::min(estimated_pairs, max_initial_pairs);
+
+    // Use int32 for pair indices - sufficient for up to 2^31 atoms, saves 50% memory
+    auto d_pairs = torch::empty({static_cast<long>(estimated_pairs), 2}, options_int);
     auto d_shifts = torch::empty({static_cast<long>(estimated_pairs), 3}, options_int);
     auto d_n_pairs = torch::zeros({1}, options_long);
 
@@ -482,9 +514,10 @@ std::tuple<torch::Tensor, torch::Tensor> hip_compute_neighborlist_cell_list(
         cell_offsets.data_ptr<int>(),
         cell_counts_copy.data_ptr<int>(),
         cell_atoms.data_ptr<int>(),
-        reinterpret_cast<ulong2*>(d_pairs.data_ptr<int64_t>()),
+        reinterpret_cast<uint2*>(d_pairs.data_ptr<int32_t>()),
         reinterpret_cast<int3*>(d_shifts.data_ptr<int32_t>()),
-        reinterpret_cast<size_t*>(d_n_pairs.data_ptr<int64_t>())
+        reinterpret_cast<size_t*>(d_n_pairs.data_ptr<int64_t>()),
+        estimated_pairs  // max_pairs for bounds checking
     );
 
     err = hipGetLastError();
@@ -496,8 +529,9 @@ std::tuple<torch::Tensor, torch::Tensor> hip_compute_neighborlist_cell_list(
 
     // Handle overflow: if we got more pairs than estimated, reallocate and retry
     if (n_pairs_val > estimated_pairs) {
-        d_pairs = torch::empty({static_cast<long>(n_pairs_val + 1000), 2}, options_long);
-        d_shifts = torch::empty({static_cast<long>(n_pairs_val + 1000), 3}, options_int);
+        size_t new_size = n_pairs_val + 1000;
+        d_pairs = torch::empty({static_cast<long>(new_size), 2}, options_int);
+        d_shifts = torch::empty({static_cast<long>(new_size), 3}, options_int);
         d_n_pairs.zero_();
 
         hipLaunchKernelGGL(
@@ -514,16 +548,18 @@ std::tuple<torch::Tensor, torch::Tensor> hip_compute_neighborlist_cell_list(
             cell_offsets.data_ptr<int>(),
             cell_counts_copy.data_ptr<int>(),
             cell_atoms.data_ptr<int>(),
-            reinterpret_cast<ulong2*>(d_pairs.data_ptr<int64_t>()),
+            reinterpret_cast<uint2*>(d_pairs.data_ptr<int32_t>()),
             reinterpret_cast<int3*>(d_shifts.data_ptr<int32_t>()),
-            reinterpret_cast<size_t*>(d_n_pairs.data_ptr<int64_t>())
+            reinterpret_cast<size_t*>(d_n_pairs.data_ptr<int64_t>()),
+            new_size  // max_pairs for retry
         );
 
         hipDeviceSynchronize();
         n_pairs_val = d_n_pairs.cpu().item<int64_t>();
     }
 
-    auto mapping = d_pairs.slice(0, 0, n_pairs_val).t().contiguous();
+    // Convert int32 pairs to int64 for output (PyTorch expects int64 indices)
+    auto mapping = d_pairs.slice(0, 0, n_pairs_val).t().to(torch::kInt64).contiguous();
     auto shifts = d_shifts.slice(0, 0, n_pairs_val).to(torch::kFloat32);
 
     return std::make_tuple(mapping, shifts);

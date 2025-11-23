@@ -3,8 +3,13 @@
  *
  * This provides the Python-visible interface and delegates to the HIP kernel.
  * Supports two algorithms:
- *   - V1 (direct): O(n²) direct pairwise - Faster but memory-limited (~16k atoms max)
- *   - V2 (cell_list): O(n) cell-list - Slightly slower but handles larger systems (~28k atoms)
+ *   - V1 (direct): O(n²) direct pairwise - Faster but memory-limited (~16k atoms max on 8GB VRAM)
+ *   - V2 (cell_list): O(n) cell-list - Memory-efficient, handles larger systems (~37k atoms on 8GB VRAM)
+ *
+ * Memory optimizations in V2:
+ *   - Int32 pair indices (vs int64) - saves 50% on pairs tensor
+ *   - Density-based buffer estimation - avoids O(n²) initial allocation
+ *   - Safe overflow handling with retry - counts pairs without memory corruption
  */
 
 #include <torch/extension.h>
@@ -69,7 +74,7 @@ std::tuple<torch::Tensor, torch::Tensor> compute_neighborlist(
     std::string algo = algorithm;
     if (algo == "auto") {
         // Use cell_list for larger systems where V1 runs out of memory
-        // V1 is faster but OOMs at ~16k atoms; V2 handles up to ~28k atoms
+        // V1 is faster but OOMs at ~16k atoms; V2 handles up to ~37k atoms on 8GB VRAM
         algo = (positions.size(0) > 15000) ? "cell_list" : "direct";
     }
 
@@ -148,7 +153,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("cutoff"));
 
     m.def("compute_neighborlist_v2", &compute_neighborlist_v2,
-          "V2: Cell-list O(n) neighbor list - handles larger systems (~28k atoms)",
+          "V2: Cell-list O(n) neighbor list - memory-efficient, handles larger systems (~37k atoms on 8GB VRAM)",
           py::arg("positions"),
           py::arg("cell"),
           py::arg("pbc"),

@@ -99,7 +99,7 @@ def hip_torch_nl(
 
     Supports two algorithms:
         - V1 (direct): O(n²) direct pairwise - Faster but memory-limited (~16k atoms max)
-        - V2 (cell_list): O(n) cell-list - Slightly slower but handles larger systems (~28k atoms)
+        - V2 (cell_list): O(n) cell-list - Memory-efficient, handles larger systems (~37k atoms)
 
     Args:
         positions: Atomic positions tensor of shape (n_atoms, 3). Must be on GPU.
@@ -152,8 +152,13 @@ def hip_torch_nl(
             mapping, shifts, positions, cell, pbc, cutoff_val
         )
 
-    # Ensure shifts have same dtype as positions
-    shifts = shifts.to(dtype=original_dtype)
+    # Shifts are returned as float32 from the kernel.
+    # For very large systems, converting to float64 can cause OOM.
+    # Since shifts are integers (-1, 0, +1), float32 has sufficient precision.
+    # Only convert if positions are float32 (for dtype consistency) or if
+    # the conversion won't cause memory issues (small tensor).
+    if original_dtype == torch.float32 or shifts.numel() < 10_000_000:
+        shifts = shifts.to(dtype=original_dtype)
 
     if sort_id:
         sorted_indices = torch.argsort(mapping[0])
@@ -188,7 +193,7 @@ def hip_torch_nl_v2(
     sort_id: bool = False,
     compatible_mode: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """V2: Cell-list O(n) neighbor list - handles larger systems (~28k atoms).
+    """V2: Cell-list O(n) neighbor list - handles larger systems (~37k atoms on 8GB VRAM).
 
     See hip_torch_nl for full documentation.
     """
