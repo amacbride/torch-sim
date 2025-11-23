@@ -154,7 +154,10 @@ __global__ void compute_neighbors_full(
             if (valid) {
                 size_t out_idx = atomicAdd((unsigned long long*)n_pairs, 1ULL);
                 pairs[out_idx] = make_ulong2(i, j);
-                shifts_out[out_idx] = shift;
+                // Negate shift to match standard_nl convention:
+                // standard_nl: D = pos[j] - pos[i] + S @ cell
+                // Our shift is from MIC: we subtracted shift to get minimum image
+                shifts_out[out_idx] = make_int3(-shift.x, -shift.y, -shift.z);
             }
         }
     }
@@ -333,7 +336,9 @@ __global__ void compute_neighbors_cell_list(
                         // Only write if within buffer bounds (count overflow but don't write)
                         if (out_idx < max_pairs) {
                             pairs[out_idx] = make_uint2((unsigned int)i, (unsigned int)j);
-                            shifts_out[out_idx] = shift;
+                            // Negate shift to match standard_nl convention:
+                            // standard_nl: D = pos[j] - pos[i] + S @ cell
+                            shifts_out[out_idx] = make_int3(-shift.x, -shift.y, -shift.z);
                         }
                         // else: pair is counted but not written (overflow detected on host)
                     }
